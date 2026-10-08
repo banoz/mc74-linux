@@ -1,0 +1,15 @@
+# Upstream sources this repository builds on. Nothing below is copied into the repo;
+# scripts/fetch-sources.sh downloads each item and checks the pin.
+#
+# name            kind   pin                                         location
+linux             git    546dcac3f6d7f8bcc10ddb0969a221cdf2b676b1    https://github.com/bcm-kona-mainline/linux.git (branch kona/7.1, Linux 7.1.0)
+busybox           tar    sha256:34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53bb2  https://busybox.net/downloads/busybox-1.38.0.tar.bz2
+alpine-minirootfs tar    sha256:5552f1ef2398cee46ef2cf733f8f1258f39a77ad065dfd47282fc0df9fe1976c  http://dl-cdn.alpinelinux.org/alpine/v3.24/releases/armv7/alpine-minirootfs-3.24.2-armv7.tar.gz
+#
+# Reference sources (read, not built; drivers were ported from or checked against them):
+roku-linux        tar    sha256:0998db8eba524d912d4cb26643621f531bccec442dba15ad97f16fd6e65044cf  Roku GPL release (Roku 2/3 OSS, https://www.roku.com/ossfiles/v9.4.0/OSS-Roku2_3/sources): linux-3.0.82-grsec.tar.bz2
+roku-u-boot       tar    sha256:095f2cf4bff054e260c890bb884faff17132ccad7f01637dbe09edd296ff249d  same release: u-boot-2011.06.tar.bz2
+roku-buildroot    tar    sha256:c4e0dd28ce43903a1dd6aaf53a180837ef03f23e569b9352d41c016cfd946561  same release: buildroot-2010.11.tar.bz2
+#
+# Toolchain used for every build in this repo:
+#   arm-linux-gnueabihf-gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, Ubuntu 24.04 package gcc-arm-linux-gnueabihf
