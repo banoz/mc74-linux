@@ -1,0 +1,8 @@
+# u-boot commands to run BEFORE booting Linux so the VideoCore framebuffer is live
+# (Linux's simple-framebuffer at 0x843f0ba0 then shows the console). Do NOT run
+# `vc display fb pattern` - it sends FB_TERM and shuts the framebuffer down.
+gpio set 95; gpio set 6; gpio set 96; i2c mw 17 0 fc; mipi init
+vc run
+vc display power on
+vc display fb init        # -> 800x1280, pitch 3200, 0:0xc43f0ba0 (ARM 0x843f0ba0), 1:0xc47d8bc0
+vc display fb update 0
