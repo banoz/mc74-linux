@@ -1,0 +1,36 @@
+#!/bin/busybox sh
+# MC74 initramfs /init (busybox): hands over to Alpine on system2 (mmcblk0p18, mounted
+# read-only for switch_root) unless Enter is pressed on the serial console within 3 s.
+/bin/busybox --install -s
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+hostname mc74
+# Hand over to Alpine on system2 (mmcblk0p18) unless a key is pressed on the serial console.
+if [ -b /dev/mmcblk0p18 ] && grep -q PARTNAME=system2 /sys/class/block/mmcblk0p18/uevent; then
+	echo "MC74: booting Alpine from system2 in 3 s; press Enter for the initramfs shell"
+	if ! read -t 3 _k < /dev/console; then
+		mkdir -p /newroot
+		if mount -t ext4 -o ro /dev/mmcblk0p18 /newroot && [ -x /newroot/sbin/init ]; then
+			umount /sys/kernel/debug 2>/dev/null
+			for m in /dev/pts /dev /proc /sys /tmp /run; do umount $m 2>/dev/null; done
+			exec switch_root /newroot /sbin/init
+		fi
+		echo "MC74: Alpine root not usable, staying in the initramfs"
+		umount /newroot 2>/dev/null
+	fi
+fi
+echo
+echo "=== MC74 busybox userspace: $(uname -sr) ==="
+echo "eMMC is NOT mounted. Mount read-only only (mount -o ro ...) unless you mean it."
+while true; do
+	setsid cttyhack sh -l
+	echo "shell exited, respawning"
+	sleep 1
+done

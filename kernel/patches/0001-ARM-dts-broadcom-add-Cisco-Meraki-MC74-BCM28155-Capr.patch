@@ -1,0 +1,246 @@
+From 755b868a4e8700a55b2fcfe7d9273dde56084131 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 22:10:28 -0500
+Subject: [PATCH 1/5] ARM: dts: broadcom: add Cisco Meraki MC74 (BCM28155
+ Capri)
+
+Board DT for the Cisco Meraki MC74 desk phone: 510 MB RAM at 0xa0000000
+(VideoCore owns the RAM below), uartb console on a fixed 13 MHz clock,
+eMMC on sdio2, BCM4339 Wi-Fi on sdio1 (WLAN_REG_ON GPIO 90), the
+VideoCore-owned panel as a simple-framebuffer (800x1280, set up by u-boot,
+refreshed through the VC display mailbox), the Cypress/Parade cyttsp5
+touchscreen on bsc1, the ESUB Ethernet switch and the CAPH/AudioH sound
+block. There is no PMU on this board; L2, SMC and the watchdog stay off.
+
+Co-Authored-By: Vas <banoz@users.noreply.github.com>
+---
+ arch/arm/boot/dts/broadcom/Makefile           |   1 +
+ .../boot/dts/broadcom/bcm28155-cisco-mc74.dts | 204 ++++++++++++++++++
+ 2 files changed, 205 insertions(+)
+ create mode 100644 arch/arm/boot/dts/broadcom/bcm28155-cisco-mc74.dts
+
+diff --git a/arch/arm/boot/dts/broadcom/Makefile b/arch/arm/boot/dts/broadcom/Makefile
+index 2a06309ee..9209dab9e 100644
+--- a/arch/arm/boot/dts/broadcom/Makefile
++++ b/arch/arm/boot/dts/broadcom/Makefile
+@@ -111,6 +111,7 @@ dtb-$(CONFIG_ARCH_BCM_HR2) += \
+ 	bcm53340-ubnt-unifi-switch8.dtb
+ dtb-$(CONFIG_ARCH_BCM_MOBILE) += \
+ 	bcm28155-ap.dtb \
++	bcm28155-cisco-mc74.dtb \
+ 	bcm21664-garnet.dtb \
+ 	bcm21664-samsung-kylepro.dtb \
+ 	bcm23550-samsung-baffinlite.dtb \
+diff --git a/arch/arm/boot/dts/broadcom/bcm28155-cisco-mc74.dts b/arch/arm/boot/dts/broadcom/bcm28155-cisco-mc74.dts
+new file mode 100644
+index 000000000..57a69caab
+--- /dev/null
++++ b/arch/arm/boot/dts/broadcom/bcm28155-cisco-mc74.dts
+@@ -0,0 +1,204 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Cisco Meraki MC74 ("Watchtower"), Broadcom BCM28155/BCM11130 (Capri).
++ *
++ * First bring-up DT: serial console, timers, GPIO and the eMMC only.
++ * Everything that could power things off or needs the secure monitor
++ * stays disabled for now:
++ *  - no PMU/regulator node (do not let Linux touch the BCM590xx rails yet)
++ *  - no L2 cache / SMC: the MC74 secure monitor ABI differs from the
++ *    reference one (calls come back with r4-r6/lr clobbered)
++ *  - watchdog disabled
++ *  - UART clock is a fixed 13 MHz clock: the bootloader leaves uartb at
++ *    ~13 MHz (divisor 7 for 115200) and re-clocking the live console UART
++ *    killed output on the vendor 3.0 kernel.
++ */
++
++/dts-v1/;
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++
++#include "bcm11351.dtsi"
++
++/ {
++	model = "Cisco Meraki MC74";
++	compatible = "cisco,mc74", "brcm,bcm28155-ap", "brcm,bcm11351";
++
++	chosen {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++		stdout-path = "serial0:115200n8";
++		bootargs = "earlycon=uart8250,mmio32,0x3e000000 console=ttyS0,115200n8 clk_ignore_unused rdinit=/init panic=5 loglevel=8";
++
++		/*
++		 * VideoCore framebuffer set up by u-boot ("vc run; vc display fb init"):
++		 * 800x1280, 32 bpp, pitch 3200, buffer 0 at VC 0xc43f0ba0 = ARM 0x843f0ba0
++		 * (inside the VideoCore pool, below Linux RAM). The VC only shows a new frame
++		 * after an FB_UPDATE request; simpledrm sends one after every update.
++		 */
++		framebuffer0: framebuffer@843f0ba0 {
++			compatible = "simple-framebuffer";
++			reg = <0x843f0ba0 0x3e8000>;
++			width = <800>;
++			height = <1280>;
++			stride = <3200>;
++			format = "a8b8g8r8";	/* VC composes with alpha: must be opaque */
++			/* VC display_ipc mailbox + IPC doorbell: FB_UPDATE after each frame */
++			brcm,vc-display-ipc = <0x82002058 0x34005008>;
++		};
++	};
++
++	aliases {
++		serial0 = &uartb;
++		mmc0 = &sdio2;
++		mmc1 = &sdio1;
++	};
++
++	/* VideoCore owns the RAM below 0xa0000000; stock kernel uses mem=510M here */
++	memory@a0000000 {
++		device_type = "memory";
++		reg = <0xa0000000 0x1fe00000>;
++	};
++
++	/* BCM4339 WLAN_REG_ON is GPIO 90 (stock dmesg: "WLAN_REG_ON(GPIO90)") */
++	wifi_pwrseq: wifi-pwrseq {
++		compatible = "mmc-pwrseq-simple";
++		reset-gpios = <&gpio 90 GPIO_ACTIVE_LOW>;
++		post-power-on-delay-ms = <200>;
++	};
++
++	/* The MC74 has no PMU; peripheral rails are fixed (PoE-powered board) */
++	reg_3v3: regulator-3v3 {
++		compatible = "regulator-fixed";
++		regulator-name = "vcc-3v3";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-always-on;
++	};
++
++	uartb_clk: uartb-clock {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <13000000>;
++	};
++};
++
++&uartb {
++	clocks = <&uartb_clk>;
++	status = "okay";
++};
++
++/* eMMC (8-bit) on SDIO2, as on the reference board and the Roku/ray hw_cfg */
++&sdio2 {
++	non-removable;
++	bus-width = <8>;
++	max-frequency = <48000000>;
++	status = "okay";
++};
++
++/* BCM4339 Wi-Fi (SDIO, chip 0x4339 rev 1) on SDIO1; OOB host-wake is GPIO 89 (unused for now) */
++&sdio1 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	non-removable;
++	bus-width = <4>;
++	max-frequency = <48000000>;
++	mmc-pwrseq = <&wifi_pwrseq>;
++	status = "okay";
++
++	wifi@1 {
++		compatible = "brcm,bcm4339-fmac", "brcm,bcm4329-fmac";
++		reg = <1>;
++	};
++};
++
++&L2 {
++	status = "disabled";
++};
++
++/* Don't let the kernel arm the watchdog; nothing feeds it during bring-up */
++&{/watchdog@35002f40} {
++	status = "disabled";
++};
++
++/* Secure monitor calls crash on the MC74 until its ABI is understood */
++&{/smc@3404c000} {
++	status = "disabled";
++};
++
++/*
++ * I2C controllers only (no client devices yet), for read-only probing.
++ * Stock: i2c-0 has the cyttsp5 touch controller at 0x24; i2c-2 has the panel
++ * (0x0e), cm3232 (0x10), mp3309 backlight (0x17), ts3a227e (0x3b),
++ * CM36283 (0x60) and pca9632 LEDs (0x62).
++ */
++&bsc1 {
++	clock-frequency = <100000>;
++	status = "okay";
++
++	/* Cypress/Parade CYTMA448 (TrueTouch Gen5); stock: cyttsp5 0-0024, RST gpio 103, IRQ gpio 102 */
++	touchscreen@24 {
++		compatible = "cypress,tt21000";
++		reg = <0x24>;
++		interrupt-parent = <&gpio>;
++		interrupts = <102 IRQ_TYPE_EDGE_FALLING>;	/* Kona GPIO has no level IRQs */
++		reset-gpios = <&gpio 103 GPIO_ACTIVE_LOW>;
++		vdd-supply = <&reg_3v3>;
++	};
++};
++
++&bsc2 {
++	clock-frequency = <100000>;
++	status = "okay";
++};
++
++&bsc3 {
++	clock-frequency = <100000>;
++	status = "okay";
++};
++
++&pmu_bsc {
++	clock-frequency = <100000>;
++	status = "okay";
++};
++
++/ {
++	/*
++	 * ESUB Ethernet: on-chip ROBO switch (ESW) + DesignWare AHB DMA feeding the
++	 * IMP port FIFOs; two BCM54210E PHYs (stock: island-net, PHY resets GPIO 53/55,
++	 * PHY IRQs 54/50). u-boot brings up the ESUB clocks and PHYs on every boot.
++	 * reg: ESW, ESUB DMA, chipreg dummy-read register (switch read quirk).
++	 */
++	ethernet@38200000 {
++		compatible = "brcm,kona-esub-eth";
++		reg = <0x38200000 0x100000>,
++		      <0x38100000 0x1000>,
++		      <0x34040000 0x4>;
++		/*
++		 * No MAC here: the unit's address (stock "bcmmac") is device-unique.
++		 * Add local-mac-address in a local overlay, or set it from userspace
++		 * (e.g. Alpine "hwaddress ether ..."); otherwise a random one is used.
++		 */
++	};
++};
++
++/ {
++	/*
++	 * CAPH/AudioH sound card (handsfree speaker playback, analog mic capture).
++	 * Register layout from the vendor rdb: AudioH incl. IHF FIFO @+0x5000,
++	 * CFIFO, AADMAC, SSASW, AHINTC; the KHUB CCU is shared with the clock
++	 * driver and only used to ungate the AudioH/CAPH clocks.
++	 */
++	audio@35020000 {
++		compatible = "brcm,kona-caph";
++		reg = <0x35020000 0x6000>,
++		      <0x3502d000 0x1000>,
++		      <0x3502e000 0x1000>,
++		      <0x3502f000 0x800>,
++		      <0x3502f800 0x800>,
++		      <0x34000000 0x1000>;
++		reg-names = "audioh", "cfifo", "aadmac", "ssasw", "ahintc", "khub";
++	};
++};
+-- 
+2.43.0
+

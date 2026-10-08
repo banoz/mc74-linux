@@ -1,0 +1,915 @@
+From ca7f590ab1a622a2a675913d10cb93f33d68a5b2 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 22:10:28 -0500
+Subject: [PATCH 2/5] net: ethernet: broadcom: add Kona ESUB Ethernet driver
+
+The BCM281xx (Capri) ESUB is a ROBO-style switch (ESW) with two RGMII
+ports and an internal management port (IMP) wired to the CPU through
+two FIFOs: MTP (memory to port, transmit) and PTM (port to memory,
+receive), each fed by a channel of the ESUB DesignWare AHB DMA.
+
+Register layout, DMA descriptor format, the 4-byte Broadcom tag and the
+PTM/MTP setup follow Broadcom's u-boot bcm11140_eth driver and the
+island_net.c driver in Roku's linux-3.0.82 GPL release. Notable details:
+- the PTM config register is ESW+0x80008; writing ESW+0x80000 instead
+  makes received data arrive byte-reversed within each 64-bit word
+- the DMA does not check descriptor ownership, so after an RX overrun
+  the ring is re-synced to the oldest filled slot (as island_net does)
+- switch registers need 64-bit accesses and a dummy chipreg read first
+
+RX is NAPI polled from an hrtimer (no IRQ yet), TX is synchronous.
+
+Co-Authored-By: Vas <banoz@users.noreply.github.com>
+---
+ drivers/net/ethernet/broadcom/Kconfig         |   8 +
+ drivers/net/ethernet/broadcom/Makefile        |   1 +
+ drivers/net/ethernet/broadcom/kona_esub_eth.c | 849 ++++++++++++++++++
+ 3 files changed, 858 insertions(+)
+ create mode 100644 drivers/net/ethernet/broadcom/kona_esub_eth.c
+
+diff --git a/drivers/net/ethernet/broadcom/Kconfig b/drivers/net/ethernet/broadcom/Kconfig
+index 4287edc7d..4802aaa2a 100644
+--- a/drivers/net/ethernet/broadcom/Kconfig
++++ b/drivers/net/ethernet/broadcom/Kconfig
+@@ -19,6 +19,14 @@ config NET_VENDOR_BROADCOM
+ 
+ if NET_VENDOR_BROADCOM
+ 
++config KONA_ESUB_ETH
++	tristate "Broadcom Kona (BCM281xx) ESUB Ethernet"
++	depends on ARCH_BCM_MOBILE || COMPILE_TEST
++	depends on ARM
++	help
++	  Ethernet switch subsystem (ESUB) found on Broadcom BCM281xx
++	  (Capri) SoCs, e.g. the Cisco Meraki MC74.
++
+ config B44
+ 	tristate "Broadcom 440x/47xx ethernet support"
+ 	depends on SSB_POSSIBLE && HAS_DMA
+diff --git a/drivers/net/ethernet/broadcom/Makefile b/drivers/net/ethernet/broadcom/Makefile
+index 10cc1c92e..6d5664e89 100644
+--- a/drivers/net/ethernet/broadcom/Makefile
++++ b/drivers/net/ethernet/broadcom/Makefile
+@@ -19,3 +19,4 @@ obj-$(CONFIG_SYSTEMPORT) += bcmsysport.o
+ obj-$(CONFIG_BNXT) += bnxt/
+ obj-$(CONFIG_BCMASP) += asp2/
+ obj-$(CONFIG_BNGE) += bnge/
++obj-$(CONFIG_KONA_ESUB_ETH) += kona_esub_eth.o
+diff --git a/drivers/net/ethernet/broadcom/kona_esub_eth.c b/drivers/net/ethernet/broadcom/kona_esub_eth.c
+new file mode 100644
+index 000000000..0c114339f
+--- /dev/null
++++ b/drivers/net/ethernet/broadcom/kona_esub_eth.c
+@@ -0,0 +1,849 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Broadcom Kona (BCM281xx "Capri") ESUB Ethernet
++ *
++ * The ESUB contains a ROBO-style switch (ESW) with two external ports
++ * (RGMII PHYs) and an internal management port (IMP) that is connected to
++ * the CPU through two FIFOs:
++ *   MTP (memory -> port) for transmit, PTM (port -> memory) for receive.
++ * Both FIFOs are fed by channels of a Synopsys DesignWare AHB DMA controller.
++ * Frames on the IMP carry a 4-byte Broadcom tag after the source MAC.
++ *
++ * Ported from Broadcom's GPL u-boot driver (drivers/net/bcm11140_eth.c,
++ * bcm11140_ethHw.c) and the vendor Linux 3.0 island_net driver.
++ *
++ * This first version relies on the bootloader having brought up the ESUB
++ * clocks/PLL and released the PHY resets (the MC74's u-boot always does),
++ * uses NAPI polling for RX and synchronous TX.
++ */
++
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/etherdevice.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/netdevice.h>
++#include <linux/of.h>
++#include <linux/of_net.h>
++#include <linux/platform_device.h>
++#include <linux/timer.h>
++
++#define DRV_NAME	"kona-esub-eth"
++
++static bool phy_rgmii_fix;
++module_param(phy_rgmii_fix, bool, 0644);
++MODULE_PARM_DESC(phy_rgmii_fix, "write the PHY RGMII TX-delay shadow register on link (as u-boot does)");
++
++static int rx_dump;
++module_param(rx_dump, int, 0644);
++MODULE_PARM_DESC(rx_dump, "hex-dump this many received frames (debug)");
++
++/* ---- Switch (ESW) registers: (page << 8 | reg) * 8, 64-bit access ---- */
++#define ESW_REG(page, reg)		((((page) << 8) + (reg)) * 8)
++#define ESW_PAGE_CTRL			0x00
++#define ESW_PAGE_STATUS			0x01
++#define ESW_PAGE_MGMT			0x02
++#define ESW_PAGE_ARL			0x05
++#define ESW_PAGE_IMP_CTRL		0x34
++
++#define ESW_PORT_CTRL(p)		ESW_REG(ESW_PAGE_CTRL, (p))
++#define  PORTCTRL_MAC_TX_DISABLE	0x002
++#define  PORTCTRL_MAC_RX_DISABLE	0x001
++#define  PORTCTRL_STP_SHIFT		5
++#define  PORTCTRL_STP_MASK		(7 << PORTCTRL_STP_SHIFT)
++#define  PORTCTRL_STP_FORWARDING	5	/* enum offset 1 + FORWARDING(4) */
++#define ESW_IMP_CTRL			ESW_REG(ESW_PAGE_CTRL, 0x08)
++#define  IMPCTRL_RX_UCAST_EN		0x10
++#define  IMPCTRL_RX_MCAST_EN		0x08
++#define  IMPCTRL_RX_BCAST_EN		0x04
++#define ESW_SWITCH_MODE			ESW_REG(ESW_PAGE_CTRL, 0x0b)
++#define  SW_FWDG_EN			0x02
++#define  SW_FWDG_MODE			0x01
++#define ESW_LINK_STATUS			ESW_REG(ESW_PAGE_STATUS, 0x00)
++#define ESW_PORT_SPEED			ESW_REG(ESW_PAGE_STATUS, 0x04)
++#define  PORT_SPEED_SHIFT(p)		(2 * (p))
++#define  PORT_SPEED_100			0x1
++#define  PORT_SPEED_1000		0x2
++#define ESW_GBL_MGMT_CTRL		ESW_REG(ESW_PAGE_MGMT, 0x00)
++#define  GBLMGMT_IMP_MODE_MASK		0xc0
++#define  GBLMGMT_IMP_MODE_EN		0x80
++#define ESW_ARL_RWCTRL			ESW_REG(ESW_PAGE_ARL, 0x00)
++#define  ARL_START_DONE			0x80
++#define  ARL_READ			0x01
++#define  ARL_WRITE			0x00
++#define ESW_ARL_MAC_INDEX		ESW_REG(ESW_PAGE_ARL, 0x02)
++#define ESW_ARL_VLAN_INDEX		ESW_REG(ESW_PAGE_ARL, 0x08)
++#define ESW_ARL_MAC_VID_ENTRY(x)	ESW_REG(ESW_PAGE_ARL, 0x10 + (x) * 0x10)
++#define ESW_ARL_FWD_ENTRY(x)		ESW_REG(ESW_PAGE_ARL, 0x18 + (x) * 0x10)
++#define  ARL_FWD_VALID			0x00010000
++#define  ARL_FWD_STATIC			0x00008000
++#define  ARL_FWD_AGE			0x00004000
++#define ESW_IMP_ENABLE			ESW_REG(ESW_PAGE_IMP_CTRL, 0x06)
++#define  IMP_ENABLE			0x1
++
++/* Non-paged ESW registers (offsets from ESW base) */
++#define ESW_PTM_CONFIG			0x80008	/* u-boot ethHw_regPtmConfig; 0x80000 is something else (writing it byte-swaps RX) */
++#define  PTM_CONFIG_ENABLE		0x90000000
++#define  PTM_CONFIG_BURST(b)		((b) << 1)
++#define  PTM_CONFIG_BLOCK(b)		((b) << 10)
++#define ESW_PTM_DMA_STATUS		0x80010
++#define ESW_PTM_FIFO			0x88000
++#define ESW_MTP_CONFIG			0x90000
++#define  MTP_CONFIG_ENABLE		0x90000001
++#define  MTP_CONFIG_BURST(b)		(((b) + 1) << 1)
++#define ESW_MTP_FIFO_CFG		0x90008
++#define ESW_MTP_DMA_STATUS		0x90010
++#define ESW_MTP_FIFO_DATA		0x98000
++#define ESW_MDIO_ADDR			0xa0008
++#define ESW_MDIO_WDATA			0xa0010
++#define ESW_MDIO_RDATA			0xa0018
++#define ESW_MDIO_STATUS			0xa0020
++#define  MDIO_DONE			0x8
++#define  MDIO_EXTRA			0x4
++#define  MDIO_READ			0x2
++#define  MDIO_WRITE			0x1
++#define MDIO_EXT_ADDR(port, reg)	(((0x80 + (port)) << 8) | (((reg) << 1) & 0xff))
++#define ESW_IMP_SPEED			0xa0090
++#define  IMP_SPEED_RX(s)		((s) << 0)
++#define  IMP_SPEED_TX(s)		((s) << 4)
++#define  IMP_SPEED_1000			0x4
++#define  IMP_SPEED_100			0x1
++#define  IMP_SPEED_10			0x3
++
++#define PORT_INT			8
++#define NUM_EXT_PORTS			2
++
++/* ---- DesignWare AHB DMA controller ---- */
++#define DW_CH(ch)			((ch) * 0x58)
++#define DW_SAR(ch)			(DW_CH(ch) + 0x00)
++#define DW_DAR(ch)			(DW_CH(ch) + 0x08)
++#define DW_LLP(ch)			(DW_CH(ch) + 0x10)
++#define DW_CTL_LO(ch)			(DW_CH(ch) + 0x18)
++#define DW_CTL_HI(ch)			(DW_CH(ch) + 0x1c)
++#define DW_SSTATAR(ch)			(DW_CH(ch) + 0x30)
++#define DW_DSTATAR(ch)			(DW_CH(ch) + 0x38)
++#define DW_CFG_LO(ch)			(DW_CH(ch) + 0x40)
++#define DW_CFG_HI(ch)			(DW_CH(ch) + 0x44)
++#define DW_MASK_TFR			0x310
++#define DW_MASK_BLOCK			0x318
++#define DW_MASK_SRC_TRAN		0x320
++#define DW_MASK_DST_TRAN		0x328
++#define DW_MASK_ERR			0x330
++#define DW_CLEAR_TFR			0x338
++#define DW_CLEAR_BLOCK			0x340
++#define DW_CLEAR_SRC_TRAN		0x348
++#define DW_CLEAR_DST_TRAN		0x350
++#define DW_CLEAR_ERR			0x358
++#define DW_DMA_CFG			0x398
++#define DW_CH_EN			0x3a0
++
++#define CTL_INT_EN			0x00000001
++#define CTL_DST_TR_WIDTH_64		0x00000006
++#define CTL_SRC_TR_WIDTH_64		0x00000030
++#define CTL_DST_MSIZE_8			0x00001000
++#define CTL_SRC_MSIZE_8			0x00008000
++#define CTL_TTFC_MP_DMAC		0x00100000
++#define CTL_TTFC_PM_PERI		0x00400000
++#define CTL_DMS_2			0x00800000
++#define CTL_SMS_2			0x02000000
++#define CTL_LLP_DST_EN			0x08000000
++#define CTL_LLP_SRC_EN			0x10000000
++#define CTL_HI_DONE			0x00001000
++#define CFG_LO_CH_PRIORITY_7		0x000000e0
++#define CFG_LO_MAX_BURST(l)		(((l) << 20) & 0x3ff00000)
++#define CFG_LO_MAX_BURST_MASK		0x3ff00000
++#define CFG_HI_FIFO_ENOUGH		0x00000002
++#define CFG_HI_AHB_HPROT_1		0x00000004
++#define CFG_HI_UPDATE_DST_STAT		0x00000020
++#define CFG_HI_UPDATE_SRC_STAT		0x00000040
++#define CFG_HI_DST_PER(i)		(((i) << 11) & 0x7800)
++
++#define CH_TX				0	/* MTP */
++#define CH_RX				1	/* PTM */
++#define DMA_BURST			8
++#define DMA_BLOCK			256
++
++#define MTP_CTL_LO	(CTL_LLP_SRC_EN | CTL_LLP_DST_EN | CTL_DMS_2 | CTL_TTFC_MP_DMAC | \
++			 CTL_DST_MSIZE_8 | CTL_SRC_TR_WIDTH_64 | CTL_DST_TR_WIDTH_64)
++#define MTP_CFG_LO	CFG_LO_CH_PRIORITY_7
++#define MTP_CFG_HI	(CFG_HI_DST_PER(1) | CFG_HI_UPDATE_DST_STAT | CFG_HI_AHB_HPROT_1 | \
++			 CFG_HI_FIFO_ENOUGH)
++#define PTM_CTL_LO	(CTL_LLP_SRC_EN | CTL_LLP_DST_EN | CTL_SMS_2 | CTL_TTFC_PM_PERI | \
++			 CTL_SRC_MSIZE_8 | CTL_SRC_TR_WIDTH_64 | CTL_DST_TR_WIDTH_64)
++#define PTM_CFG_LO	CFG_LO_CH_PRIORITY_7
++#define PTM_CFG_HI	(CFG_HI_UPDATE_SRC_STAT | CFG_HI_AHB_HPROT_1 | CFG_HI_FIFO_ENOUGH)
++
++#define DMA_CFG_EOP			0x00010000
++
++struct esub_desc {
++	u32 sar;
++	u32 dar;
++	u32 lli;
++	u32 ctl_lo;
++	u32 ctl_hi;
++	u32 stat1;
++	u32 stat2;
++	u32 rsvd;
++	u32 rsvd_len;
++} __aligned(4);
++
++#define RX_RING			128
++#define RX_BUF_SIZE		2048
++#define TX_BUF_SIZE		2048
++#define BRCM_TAG_LEN		4
++
++struct esub_priv {
++	struct net_device *ndev;
++	struct device *dev;
++	void __iomem *esw;
++	void __iomem *dmac;
++	void __iomem *dummy;		/* read before switch reads (hw quirk) */
++	phys_addr_t esw_phys;
++
++	/* one coherent block: rx descs, rx bufs, tx descs (2), tx cfg word, tx buf */
++	void *cpu;
++	dma_addr_t bus;
++	size_t size;
++	struct esub_desc *rx_desc;
++	dma_addr_t rx_desc_bus;
++	u8 *rx_buf;
++	dma_addr_t rx_buf_bus;
++	struct esub_desc *tx_desc;
++	dma_addr_t tx_desc_bus;
++	u64 *tx_cfg;
++	dma_addr_t tx_cfg_bus;
++	u8 *tx_buf;
++	dma_addr_t tx_buf_bus;
++
++	unsigned int rx_next;
++	unsigned long rx_resyncs;
++	spinlock_t tx_lock;
++	struct napi_struct napi;
++	struct hrtimer poll_timer;
++	struct timer_list link_timer;
++	int link_port;
++	int imp_speed;
++};
++
++/* ---- switch register access (atomic 64-bit, plus dummy read) ---- */
++
++static u64 esw_read64(struct esub_priv *p, u32 off)
++{
++	u64 v;
++
++	(void)readl(p->dummy);
++	asm volatile("ldrd %Q0, %R0, [%1]" : "=&r"(v) : "r"(p->esw + off) : "memory");
++	return v;
++}
++
++static void esw_write64(struct esub_priv *p, u32 off, u64 v)
++{
++	asm volatile("strd %Q0, %R0, [%1]" : : "r"(v), "r"(p->esw + off) : "memory");
++}
++
++static u32 esw_read(struct esub_priv *p, u32 off)
++{
++	return (u32)esw_read64(p, off);
++}
++
++static void esw_write(struct esub_priv *p, u32 off, u32 v)
++{
++	esw_write64(p, off, v);
++}
++
++static void esw_rmw(struct esub_priv *p, u32 off, u32 clr, u32 set)
++{
++	esw_write(p, off, (esw_read(p, off) & ~clr) | set);
++}
++
++static int esw_arl_wait(struct esub_priv *p)
++{
++	int i;
++
++	for (i = 0; i < 1000; i++) {
++		if (!(esw_read(p, ESW_ARL_RWCTRL) & ARL_START_DONE))
++			return 0;
++		udelay(10);
++	}
++	return -ETIMEDOUT;
++}
++
++static u64 mac_to_u64(const u8 *m)
++{
++	return ((u64)m[0] << 40) | ((u64)m[1] << 32) | ((u64)m[2] << 24) |
++	       ((u64)m[3] << 16) | ((u64)m[4] << 8) | m[5];
++}
++
++/* Static ARL entry: our MAC -> internal (CPU) port */
++static int esw_arl_set(struct esub_priv *p, const u8 *addr, int port)
++{
++	u64 mac = mac_to_u64(addr), mac2;
++	int i, ret;
++
++	esw_write64(p, ESW_ARL_MAC_INDEX, mac);
++	esw_write(p, ESW_ARL_VLAN_INDEX, 0);
++	esw_write(p, ESW_ARL_RWCTRL, ARL_START_DONE | ARL_READ);
++	ret = esw_arl_wait(p);
++	if (ret)
++		return ret;
++
++	for (i = 0; i < 4; i++) {
++		if (!(esw_read(p, ESW_ARL_FWD_ENTRY(i)) & ARL_FWD_VALID))
++			break;
++		mac2 = esw_read64(p, ESW_ARL_MAC_VID_ENTRY(i));
++		if (mac2 == mac)
++			break;
++	}
++	if (i == 4)
++		return -ENOSPC;
++
++	esw_write(p, ESW_ARL_FWD_ENTRY(i), ARL_FWD_AGE | ARL_FWD_VALID | ARL_FWD_STATIC | port);
++	esw_write64(p, ESW_ARL_MAC_VID_ENTRY(i), mac);
++	esw_write64(p, ESW_ARL_MAC_INDEX, mac);
++	esw_write(p, ESW_ARL_VLAN_INDEX, 0);
++	esw_write(p, ESW_ARL_RWCTRL, ARL_START_DONE | ARL_WRITE);
++	return esw_arl_wait(p);
++}
++
++static int esw_port_speed(struct esub_priv *p, int port)
++{
++	u32 s = (esw_read(p, ESW_PORT_SPEED) >> PORT_SPEED_SHIFT(port)) & 3;
++
++	return (s & PORT_SPEED_1000) ? 1000 : (s & PORT_SPEED_100) ? 100 : 10;
++}
++
++static u32 imp_speed_bits(int mbps)
++{
++	return mbps == 1000 ? IMP_SPEED_1000 : mbps == 100 ? IMP_SPEED_100 : IMP_SPEED_10;
++}
++
++static void esw_imp_speed_set(struct esub_priv *p, int rx, int tx)
++{
++	esw_rmw(p, ESW_IMP_SPEED, IMP_SPEED_RX(0xf) | IMP_SPEED_TX(0xf),
++		IMP_SPEED_RX(imp_speed_bits(rx)) | IMP_SPEED_TX(imp_speed_bits(tx)));
++}
++
++/* speed of the first external port with link (port 0 preferred, as in u-boot), else 1000 */
++static int esw_ext_speed(struct esub_priv *p, int *portp)
++{
++	u32 st = esw_read(p, ESW_LINK_STATUS);
++	int port = (st & BIT(0)) ? 0 : (st & BIT(1)) ? 1 : -1;
++
++	if (portp)
++		*portp = port;
++	return port >= 0 ? esw_port_speed(p, port) : 1000;
++}
++
++/* MDIO to the external PHYs through the switch (u-boot ethHw_miiSet/Get, EXT flag) */
++static int esw_mdio_wait(struct esub_priv *p)
++{
++	int i;
++
++	for (i = 0; i < 10000; i++)
++		if (!(esw_read(p, ESW_MDIO_STATUS) & MDIO_DONE))
++			return 0;
++	return -ETIMEDOUT;
++}
++
++static int esw_mii_write(struct esub_priv *p, int port, u32 reg, u16 val)
++{
++	esw_write(p, ESW_MDIO_ADDR, MDIO_EXT_ADDR(port, reg));
++	esw_write(p, ESW_MDIO_WDATA, val);
++	esw_write(p, ESW_MDIO_STATUS, MDIO_DONE | MDIO_EXTRA | MDIO_WRITE);
++	return esw_mdio_wait(p);
++}
++
++static int __maybe_unused esw_mii_read(struct esub_priv *p, int port, u32 reg)
++{
++	int ret;
++
++	esw_write(p, ESW_MDIO_ADDR, MDIO_EXT_ADDR(port, reg));
++	esw_write(p, ESW_MDIO_STATUS, MDIO_DONE | MDIO_EXTRA | MDIO_READ);
++	ret = esw_mdio_wait(p);
++	if (ret)
++		return ret;
++	return esw_read(p, ESW_MDIO_RDATA) & 0xffff;
++}
++
++/*
++ * RGMII TX clock delay in the Broadcom PHY (shadow 0x1c, sel 0x3 "clock alignment",
++ * bit 9 = TX delay): off at 1000 Mbps, on at 10/100 - exactly what the MC74's u-boot
++ * does in open(). Without it the IMP never sees received frames.
++ */
++static void esw_phy_rgmii_delay(struct esub_priv *p, int port, int speed)
++{
++	if (!phy_rgmii_fix)
++		return;
++	/*
++	 * Shadow 0x1c sel 0x3: write-enable (bit 15) | sel (0x0c00) | TX delay (bit 9).
++	 * The MC74's u-boot leaves exactly 0x8c00 here at 1000 Mbps; write the
++	 * constant rather than read-modify-write (a bad MDIO read here corrupted the
++	 * RGMII RX path: ESW_BUSIF_IMP_EXTERNAL_RGMII_RX_LNKSPD_STAT went to 0).
++	 */
++	esw_mii_write(p, port, 0x1c, speed == 1000 ? 0x8c00 : 0x8e00);
++}
++
++static void esw_mac_enable(struct esub_priv *p, int port, bool en)
++{
++	esw_rmw(p, ESW_PORT_CTRL(port), PORTCTRL_MAC_TX_DISABLE | PORTCTRL_MAC_RX_DISABLE,
++		en ? 0 : PORTCTRL_MAC_TX_DISABLE | PORTCTRL_MAC_RX_DISABLE);
++}
++
++static void esw_imp_enable(struct esub_priv *p, bool en)
++{
++	esw_rmw(p, ESW_GBL_MGMT_CTRL, GBLMGMT_IMP_MODE_MASK, en ? GBLMGMT_IMP_MODE_EN : 0);
++}
++
++static void esw_init(struct esub_priv *p)
++{
++	int port;
++
++	esw_rmw(p, ESW_SWITCH_MODE, 0, SW_FWDG_EN | SW_FWDG_MODE);
++	/* accept broadcast + unlearned multicast on the IMP, drop unlearned unicast */
++	esw_rmw(p, ESW_IMP_CTRL, IMPCTRL_RX_UCAST_EN, IMPCTRL_RX_BCAST_EN | IMPCTRL_RX_MCAST_EN);
++	esw_mac_enable(p, PORT_INT, false);
++	esw_imp_enable(p, false);
++	for (port = 0; port < NUM_EXT_PORTS; port++)
++		esw_rmw(p, ESW_PORT_CTRL(port), PORTCTRL_STP_MASK,
++			PORTCTRL_STP_FORWARDING << PORTCTRL_STP_SHIFT);
++}
++
++/* ---- DMA ---- */
++
++static void dw_write(struct esub_priv *p, u32 off, u32 v)
++{
++	writel(v, p->dmac + off);
++}
++
++static u32 dw_read(struct esub_priv *p, u32 off)
++{
++	return readl(p->dmac + off);
++}
++
++static void dw_ch_config(struct esub_priv *p, int ch, u32 ctl_lo, u32 cfg_lo, u32 cfg_hi,
++			 u32 sstat, u32 dstat)
++{
++	u32 bit = BIT(ch);
++
++	dw_write(p, DW_CTL_LO(ch), ctl_lo);
++	dw_write(p, DW_CTL_HI(ch), 0);
++	dw_write(p, DW_CFG_LO(ch), (cfg_lo & ~CFG_LO_MAX_BURST_MASK) | CFG_LO_MAX_BURST(8));
++	dw_write(p, DW_CFG_HI(ch), cfg_hi);
++	dw_write(p, DW_SSTATAR(ch), sstat);
++	dw_write(p, DW_DSTATAR(ch), dstat);
++	/* clear and mask all interrupts for this channel (we poll) */
++	dw_write(p, DW_CLEAR_TFR, bit);
++	dw_write(p, DW_CLEAR_BLOCK, bit);
++	dw_write(p, DW_CLEAR_SRC_TRAN, bit);
++	dw_write(p, DW_CLEAR_DST_TRAN, bit);
++	dw_write(p, DW_CLEAR_ERR, bit);
++	dw_write(p, DW_MASK_TFR, bit << 8);
++	dw_write(p, DW_MASK_BLOCK, bit << 8);
++	dw_write(p, DW_MASK_SRC_TRAN, bit << 8);
++	dw_write(p, DW_MASK_DST_TRAN, bit << 8);
++	dw_write(p, DW_MASK_ERR, bit << 8);
++}
++
++static void dw_ch_start(struct esub_priv *p, int ch, dma_addr_t llp)
++{
++	dw_write(p, DW_LLP(ch), llp);
++	dw_write(p, DW_CH_EN, BIT(ch + 8) | BIT(ch));
++}
++
++static void dw_ch_stop(struct esub_priv *p, int ch)
++{
++	int i;
++
++	dw_write(p, DW_CH_EN, BIT(ch + 8));
++	for (i = 0; i < 1000 && (dw_read(p, DW_CH_EN) & BIT(ch)); i++)
++		udelay(1);
++}
++
++static void rx_desc_init(struct esub_priv *p, int i)
++{
++	struct esub_desc *d = &p->rx_desc[i];
++
++	d->sar = p->esw_phys + ESW_PTM_FIFO;
++	d->dar = p->rx_buf_bus + i * RX_BUF_SIZE;
++	d->lli = p->rx_desc_bus + ((i + 1) % RX_RING) * sizeof(*d);
++	d->ctl_lo = PTM_CTL_LO;
++	d->ctl_hi = RX_BUF_SIZE;
++	d->stat1 = 0;
++	d->stat2 = 0;
++	d->rsvd = 0;
++	d->rsvd_len = 0;
++}
++
++/* ---- RX (NAPI, polled) ---- */
++
++static bool rx_desc_done(struct esub_desc *d)
++{
++	return (READ_ONCE(d->ctl_hi) & CTL_HI_DONE) && READ_ONCE(d->stat1);
++}
++
++static int esub_poll(struct napi_struct *napi, int budget)
++{
++	struct esub_priv *p = container_of(napi, struct esub_priv, napi);
++	struct net_device *ndev = p->ndev;
++	int done = 0;
++
++	while (done < budget) {
++		struct esub_desc *d = &p->rx_desc[p->rx_next];
++		u8 *buf = p->rx_buf + p->rx_next * RX_BUF_SIZE;
++		struct sk_buff *skb;
++		unsigned int len;
++
++		/* done bit can be set before stat1 is written: need both */
++		if (!rx_desc_done(d)) {
++			/*
++			 * The DMA does not check descriptor ownership: after an
++			 * overrun it keeps filling slots further on while this one
++			 * stays empty. Re-sync to the oldest filled slot (as the
++			 * vendor driver does), counting the skipped ones as dropped.
++			 */
++			int i, n = 0;
++
++			for (i = 1; i < RX_RING; i++) {
++				if (rx_desc_done(&p->rx_desc[(p->rx_next + i) % RX_RING])) {
++					n = i;
++					break;
++				}
++			}
++			if (!n)
++				break;
++			p->rx_resyncs++;
++			ndev->stats.rx_dropped += n;
++			p->rx_next = (p->rx_next + n) % RX_RING;
++			if (net_ratelimit())
++				netdev_info(ndev, "rx re-sync #%lu: skipped %d slot(s)\n", p->rx_resyncs, n);
++			continue;
++		}
++		dma_rmb();
++		len = (d->stat1 >> 13) & 0xffff;
++		if (rx_dump > 0) {
++			rx_dump--;
++			netdev_info(ndev, "rx desc %u stat1 %08x stat2 %08x ctl_hi %08x len %u\n",
++				    p->rx_next, d->stat1, d->stat2, d->ctl_hi, len);
++			print_hex_dump(KERN_INFO, "rx: ", DUMP_PREFIX_OFFSET, 16, 1, buf,
++				       min(len + 8, 96u), false);
++		}
++
++		if (len < ETH_ZLEN || len > RX_BUF_SIZE) {
++			ndev->stats.rx_length_errors++;
++		} else {
++			/* drop the 4-byte Broadcom tag that follows the source MAC */
++			len -= BRCM_TAG_LEN;
++			skb = napi_alloc_skb(napi, len);
++			if (!skb) {
++				ndev->stats.rx_dropped++;
++			} else {
++				skb_put_data(skb, buf, 2 * ETH_ALEN);
++				skb_put_data(skb, buf + 2 * ETH_ALEN + BRCM_TAG_LEN,
++					     len - 2 * ETH_ALEN);
++				skb->protocol = eth_type_trans(skb, ndev);
++				ndev->stats.rx_packets++;
++				ndev->stats.rx_bytes += len;
++				napi_gro_receive(napi, skb);
++			}
++		}
++
++		/* give the descriptor back to the DMA */
++		d->ctl_hi = RX_BUF_SIZE;
++		d->stat1 = 0;
++		dma_wmb();
++		p->rx_next = (p->rx_next + 1) % RX_RING;
++		done++;
++	}
++
++	if (done < budget)
++		napi_complete_done(napi, done);
++	return done;
++}
++
++static enum hrtimer_restart esub_poll_timer(struct hrtimer *t)
++{
++	struct esub_priv *p = container_of(t, struct esub_priv, poll_timer);
++
++	napi_schedule(&p->napi);
++	hrtimer_forward_now(t, ms_to_ktime(2));
++	return HRTIMER_RESTART;
++}
++
++/* ---- TX (synchronous, like the u-boot driver) ---- */
++
++static netdev_tx_t esub_xmit(struct sk_buff *skb, struct net_device *ndev)
++{
++	struct esub_priv *p = netdev_priv(ndev);
++	unsigned long flags;
++	unsigned int len = skb->len;
++	u8 *b = p->tx_buf;
++	int i;
++
++	if (len < 2 * ETH_ALEN || len + BRCM_TAG_LEN + ETH_FCS_LEN > TX_BUF_SIZE) {
++		ndev->stats.tx_dropped++;
++		dev_kfree_skb_any(skb);
++		return NETDEV_TX_OK;
++	}
++
++	spin_lock_irqsave(&p->tx_lock, flags);
++
++	skb_copy_bits(skb, 0, b, 2 * ETH_ALEN);
++	memset(b + 2 * ETH_ALEN, 0, BRCM_TAG_LEN);		/* empty Broadcom tag */
++	skb_copy_bits(skb, 2 * ETH_ALEN, b + 2 * ETH_ALEN + BRCM_TAG_LEN, len - 2 * ETH_ALEN);
++	len += BRCM_TAG_LEN;
++	if (len < 64) {						/* switch needs >= 64 */
++		memset(b + len, 0, 64 - len);
++		len = 64;
++	}
++	len += ETH_FCS_LEN;
++
++	/* config word: EOP + byte offsets of first/last 64-bit word (buffer is 8-aligned) */
++	*p->tx_cfg = DMA_CFG_EOP | (((len - 1) % 8) << 8);
++
++	p->tx_desc[0].sar = p->tx_cfg_bus;
++	p->tx_desc[0].dar = p->esw_phys + ESW_MTP_FIFO_CFG;
++	p->tx_desc[0].lli = p->tx_desc_bus + sizeof(struct esub_desc);
++	p->tx_desc[0].ctl_lo = MTP_CTL_LO;
++	p->tx_desc[0].ctl_hi = 1;				/* one 64-bit transfer */
++	p->tx_desc[0].stat1 = p->tx_desc[0].stat2 = 0;
++
++	p->tx_desc[1].sar = p->tx_buf_bus;
++	p->tx_desc[1].dar = p->esw_phys + ESW_MTP_FIFO_DATA;
++	p->tx_desc[1].lli = 0;
++	p->tx_desc[1].ctl_lo = MTP_CTL_LO;
++	p->tx_desc[1].ctl_hi = (len + 7) / 8;
++	p->tx_desc[1].stat1 = p->tx_desc[1].stat2 = 0;
++	dma_wmb();
++
++	dw_ch_start(p, CH_TX, p->tx_desc_bus);
++	for (i = 0; i < 2000; i++) {
++		if (READ_ONCE(p->tx_desc[0].ctl_hi) & CTL_HI_DONE &&
++		    READ_ONCE(p->tx_desc[1].ctl_hi) & CTL_HI_DONE)
++			break;
++		udelay(1);
++	}
++	dw_ch_stop(p, CH_TX);
++
++	if (i == 2000) {
++		ndev->stats.tx_errors++;
++	} else {
++		ndev->stats.tx_packets++;
++		ndev->stats.tx_bytes += skb->len;
++	}
++	spin_unlock_irqrestore(&p->tx_lock, flags);
++	dev_kfree_skb_any(skb);
++	return NETDEV_TX_OK;
++}
++
++/* ---- link ---- */
++
++static void esub_link_timer(struct timer_list *t)
++{
++	struct esub_priv *p = timer_container_of(p, t, link_timer);
++	u32 st = esw_read(p, ESW_LINK_STATUS);
++	int port = (st & BIT(0)) ? 0 : (st & BIT(1)) ? 1 : -1;
++
++	if (port >= 0 && !netif_carrier_ok(p->ndev)) {
++		int speed = esw_port_speed(p, port);
++
++		esw_phy_rgmii_delay(p, port, speed);
++		if (speed != p->imp_speed) {
++			esw_imp_enable(p, false);
++			esw_imp_speed_set(p, speed, 1000);
++			esw_imp_enable(p, true);
++			p->imp_speed = speed;
++		}
++		netdev_info(p->ndev, "link up on port %d, %d Mbps\n", port, speed);
++		netif_carrier_on(p->ndev);
++	} else if (port < 0 && netif_carrier_ok(p->ndev)) {
++		netdev_info(p->ndev, "link down\n");
++		netif_carrier_off(p->ndev);
++	}
++	p->link_port = port;
++	mod_timer(&p->link_timer, jiffies + HZ);
++}
++
++/* ---- netdev ops ---- */
++
++static int esub_open(struct net_device *ndev)
++{
++	struct esub_priv *p = netdev_priv(ndev);
++	int i, ret;
++
++	ret = esw_arl_set(p, ndev->dev_addr, PORT_INT);
++	if (ret)
++		netdev_warn(ndev, "ARL entry for own MAC failed: %d\n", ret);
++
++	{
++		int lp, sp = esw_ext_speed(p, &lp);
++
++		if (lp >= 0)
++			esw_phy_rgmii_delay(p, lp, sp);
++	}
++
++	/* must be set before the IMP is enabled: it latches the speed at enable time */
++	p->imp_speed = esw_ext_speed(p, NULL);
++	esw_imp_speed_set(p, p->imp_speed, 1000);
++	esw_imp_enable(p, true);
++	esw_mac_enable(p, PORT_INT, true);
++
++	for (i = 0; i < RX_RING; i++)
++		rx_desc_init(p, i);
++	p->rx_next = 0;
++	dma_wmb();
++
++	dw_write(p, DW_DMA_CFG, 1);
++	dw_ch_stop(p, CH_RX);
++	dw_ch_stop(p, CH_TX);
++
++	writel(PTM_CONFIG_ENABLE | PTM_CONFIG_BURST(DMA_BURST) |
++	       PTM_CONFIG_BLOCK(DMA_BLOCK), p->esw + ESW_PTM_CONFIG);
++	dw_ch_config(p, CH_RX, PTM_CTL_LO, PTM_CFG_LO, PTM_CFG_HI,
++		     p->esw_phys + ESW_PTM_DMA_STATUS, 0);
++
++	esw_rmw(p, ESW_IMP_ENABLE, IMP_ENABLE, IMP_ENABLE);
++	writel(MTP_CONFIG_ENABLE | MTP_CONFIG_BURST(DMA_BURST), p->esw + ESW_MTP_CONFIG);
++	dw_ch_config(p, CH_TX, MTP_CTL_LO, MTP_CFG_LO, MTP_CFG_HI,
++		     0, p->esw_phys + ESW_MTP_DMA_STATUS);
++
++	dw_ch_start(p, CH_RX, p->rx_desc_bus);
++
++	napi_enable(&p->napi);
++	hrtimer_start(&p->poll_timer, ms_to_ktime(2), HRTIMER_MODE_REL);
++	netif_carrier_off(ndev);
++	p->link_port = -1;
++	mod_timer(&p->link_timer, jiffies + HZ / 10);
++	netif_start_queue(ndev);
++	return 0;
++}
++
++static int esub_stop(struct net_device *ndev)
++{
++	struct esub_priv *p = netdev_priv(ndev);
++
++	netif_stop_queue(ndev);
++	timer_delete_sync(&p->link_timer);
++	hrtimer_cancel(&p->poll_timer);
++	napi_disable(&p->napi);
++	dw_ch_stop(p, CH_RX);
++	dw_ch_stop(p, CH_TX);
++	esw_mac_enable(p, PORT_INT, false);
++	esw_imp_enable(p, false);
++	netif_carrier_off(ndev);
++	return 0;
++}
++
++static int esub_set_mac(struct net_device *ndev, void *addr)
++{
++	struct esub_priv *p = netdev_priv(ndev);
++	int ret = eth_mac_addr(ndev, addr);
++
++	if (!ret && netif_running(ndev))
++		ret = esw_arl_set(p, ndev->dev_addr, PORT_INT);
++	return ret;
++}
++
++static const struct net_device_ops esub_netdev_ops = {
++	.ndo_open		= esub_open,
++	.ndo_stop		= esub_stop,
++	.ndo_start_xmit		= esub_xmit,
++	.ndo_set_mac_address	= esub_set_mac,
++	.ndo_validate_addr	= eth_validate_addr,
++};
++
++static int esub_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct net_device *ndev;
++	struct esub_priv *p;
++	struct resource *res;
++	size_t off;
++	int ret;
++
++	ndev = devm_alloc_etherdev(dev, sizeof(*p));
++	if (!ndev)
++		return -ENOMEM;
++	SET_NETDEV_DEV(ndev, dev);
++	p = netdev_priv(ndev);
++	p->ndev = ndev;
++	p->dev = dev;
++	spin_lock_init(&p->tx_lock);
++
++	p->esw = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
++	if (IS_ERR(p->esw))
++		return PTR_ERR(p->esw);
++	p->esw_phys = res->start;
++	p->dmac = devm_platform_ioremap_resource(pdev, 1);
++	if (IS_ERR(p->dmac))
++		return PTR_ERR(p->dmac);
++	p->dummy = devm_platform_ioremap_resource(pdev, 2);
++	if (IS_ERR(p->dummy))
++		return PTR_ERR(p->dummy);
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	p->size = RX_RING * sizeof(struct esub_desc) + RX_RING * RX_BUF_SIZE +
++		  2 * sizeof(struct esub_desc) + 8 + TX_BUF_SIZE + 64;
++	p->cpu = dmam_alloc_coherent(dev, p->size, &p->bus, GFP_KERNEL);
++	if (!p->cpu)
++		return -ENOMEM;
++
++	off = 0;
++	p->rx_desc = p->cpu + off;
++	p->rx_desc_bus = p->bus + off;
++	off += ALIGN(RX_RING * sizeof(struct esub_desc), 64);
++	p->rx_buf = p->cpu + off;
++	p->rx_buf_bus = p->bus + off;
++	off += RX_RING * RX_BUF_SIZE;
++	p->tx_desc = p->cpu + off;
++	p->tx_desc_bus = p->bus + off;
++	off += ALIGN(2 * sizeof(struct esub_desc), 8);
++	p->tx_cfg = p->cpu + off;
++	p->tx_cfg_bus = p->bus + off;
++	off += 8;
++	p->tx_buf = p->cpu + off;
++	p->tx_buf_bus = p->bus + off;
++
++	ret = of_get_ethdev_address(dev->of_node, ndev);
++	if (ret)
++		eth_hw_addr_random(ndev);
++
++	ndev->netdev_ops = &esub_netdev_ops;
++	ndev->min_mtu = ETH_ZLEN - ETH_HLEN;
++	ndev->max_mtu = 1500;
++	netif_napi_add(ndev, &p->napi, esub_poll);
++	hrtimer_setup(&p->poll_timer, esub_poll_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	timer_setup(&p->link_timer, esub_link_timer, 0);
++
++	esw_init(p);
++
++	platform_set_drvdata(pdev, ndev);
++	ret = devm_register_netdev(dev, ndev);
++	if (ret)
++		return ret;
++
++	netdev_info(ndev, "Kona ESUB Ethernet, MAC %pM, ports link 0x%x\n",
++		    ndev->dev_addr, esw_read(p, ESW_LINK_STATUS) & 3);
++	return 0;
++}
++
++static const struct of_device_id esub_of_match[] = {
++	{ .compatible = "brcm,kona-esub-eth" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, esub_of_match);
++
++static struct platform_driver esub_driver = {
++	.probe = esub_probe,
++	.driver = {
++		.name = DRV_NAME,
++		.of_match_table = esub_of_match,
++	},
++};
++module_platform_driver(esub_driver);
++
++MODULE_DESCRIPTION("Broadcom Kona ESUB Ethernet");
++MODULE_LICENSE("GPL");
+-- 
+2.43.0
+

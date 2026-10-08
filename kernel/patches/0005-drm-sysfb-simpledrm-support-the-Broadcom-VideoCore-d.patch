@@ -1,0 +1,151 @@
+From d2f3299351aea0d4f69632b305ce54f31e527974 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 22:10:29 -0500
+Subject: [PATCH 5/5] drm/sysfb: simpledrm: support the Broadcom VideoCore
+ display mailbox
+
+On Kona/Capri boards whose panel is owned by the VideoCore (Cisco MC74),
+u-boot sets up an ARM-writable framebuffer in VC memory, but the VC only
+pushes it to the panel after an FB_UPDATE request through its
+display_ipc mailbox. With the DT property
+  brcm,vc-display-ipc = <mailbox-phys doorbell-phys>;
+simpledrm queues one FB_UPDATE after every plane update and waits for
+the VC's ack, which also paces updates. The mailbox layout is the MC74
+firmware's (req at +48, ack at +52; doorbell = IPC event 13), worked out
+from u-boot's cmd_vc_display.c / slim_ipc_display.h.
+
+Co-Authored-By: Vas <banoz@users.noreply.github.com>
+---
+ drivers/gpu/drm/sysfb/simpledrm.c | 81 +++++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/drivers/gpu/drm/sysfb/simpledrm.c b/drivers/gpu/drm/sysfb/simpledrm.c
+index 7a95d2dac..8a725a258 100644
+--- a/drivers/gpu/drm/sysfb/simpledrm.c
++++ b/drivers/gpu/drm/sysfb/simpledrm.c
+@@ -2,6 +2,8 @@
+ 
+ #include <linux/aperture.h>
+ #include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/io.h>
+ #include <linux/minmax.h>
+ #include <linux/of_address.h>
+ #include <linux/of_clk.h>
+@@ -10,6 +12,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_domain.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/workqueue.h>
+ 
+ #include <drm/clients/drm_client_setup.h>
+ #include <drm/drm_atomic.h>
+@@ -222,6 +225,12 @@ struct simpledrm_device {
+ 	struct device_link **pwr_dom_links;
+ #endif
+ 
++	/* Broadcom VideoCore display mailbox (Kona/Capri, e.g. Cisco MC74) */
++	void __iomem *vc_ipc;
++	void __iomem *vc_doorbell;
++	struct work_struct vc_work;
++	u32 vc_seq;
++
+ 	/* modesetting */
+ 	u32 formats[DRM_SYSFB_PLANE_NFORMATS(1)];
+ 	struct drm_plane primary_plane;
+@@ -543,6 +552,73 @@ static int simpledrm_device_attach_genpd(struct simpledrm_device *sdev)
+ }
+ #endif
+ 
++/*
++ * VideoCore display mailbox
++ *
++ * On Broadcom Kona/Capri boards whose display is owned by the VideoCore
++ * (Cisco Meraki MC74), the bootloader sets up an ARM-writable framebuffer in
++ * VC memory, but the VC only pushes it to the panel when it receives an
++ * FB_UPDATE request through its "display_ipc" mailbox. The DT node then has
++ *   brcm,vc-display-ipc = <mailbox-phys doorbell-phys>;
++ * and every plane update is followed by one FB_UPDATE (coalesced in a work).
++ *
++ * Mailbox layout (MC74 firmware): +0 command, +4 display, +8 buffer,
++ * +48 req, +52 ack. The doorbell is IPC event 13 (write BIT(13) to ASET).
++ */
++
++#define VC_IPC_CMD		0x00
++#define VC_IPC_DISPLAY		0x04
++#define VC_IPC_BUFFER		0x08
++#define VC_IPC_REQ		0x30
++#define VC_IPC_ACK		0x34
++#define VC_IPC_SIZE		0x40
++#define VC_CMD_FB_UPDATE	4
++#define VC_DOORBELL_DISPLAY	BIT(13)
++
++static void simpledrm_vc_work(struct work_struct *work)
++{
++	struct simpledrm_device *sdev = container_of(work, struct simpledrm_device, vc_work);
++	u32 n = ++sdev->vc_seq;
++	int i;
++
++	writel(VC_CMD_FB_UPDATE, sdev->vc_ipc + VC_IPC_CMD);
++	writel(0, sdev->vc_ipc + VC_IPC_DISPLAY);
++	writel(0, sdev->vc_ipc + VC_IPC_BUFFER);
++	writel(~n, sdev->vc_ipc + VC_IPC_ACK);
++	writel(n, sdev->vc_ipc + VC_IPC_REQ);
++	writel(VC_DOORBELL_DISPLAY, sdev->vc_doorbell);
++
++	/* the VC acks once the frame is out; this also paces the updates */
++	for (i = 0; i < 100 && readl(sdev->vc_ipc + VC_IPC_ACK) != n; i++)
++		usleep_range(500, 1000);
++}
++
++static int simpledrm_vc_init(struct simpledrm_device *sdev, struct device_node *of_node)
++{
++	struct drm_device *dev = &sdev->sysfb.dev;
++	u32 addr[2];
++
++	if (!of_node || of_property_read_u32_array(of_node, "brcm,vc-display-ipc", addr, 2))
++		return 0;
++	sdev->vc_ipc = devm_ioremap(dev->dev, addr[0], VC_IPC_SIZE);
++	sdev->vc_doorbell = devm_ioremap(dev->dev, addr[1], 4);
++	if (!sdev->vc_ipc || !sdev->vc_doorbell)
++		return -ENOMEM;
++	INIT_WORK(&sdev->vc_work, simpledrm_vc_work);
++	drm_info(dev, "VideoCore display mailbox at %#x, doorbell %#x\n", addr[0], addr[1]);
++	return 0;
++}
++
++static void simpledrm_primary_plane_helper_atomic_update(struct drm_plane *plane,
++							 struct drm_atomic_state *state)
++{
++	struct simpledrm_device *sdev = container_of(plane, struct simpledrm_device, primary_plane);
++
++	drm_sysfb_plane_helper_atomic_update(plane, state);
++	if (sdev->vc_ipc)
++		queue_work(system_unbound_wq, &sdev->vc_work);
++}
++
+ /*
+  * Modesetting
+  */
+@@ -553,6 +629,7 @@ static const u64 simpledrm_primary_plane_format_modifiers[] = {
+ 
+ static const struct drm_plane_helper_funcs simpledrm_primary_plane_helper_funcs = {
+ 	DRM_SYSFB_PLANE_HELPER_FUNCS,
++	.atomic_update = simpledrm_primary_plane_helper_atomic_update,
+ };
+ 
+ static const struct drm_plane_funcs simpledrm_primary_plane_funcs = {
+@@ -741,6 +818,10 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
+ 		iosys_map_set_vaddr_iomem(&sysfb->fb_addr, screen_base);
+ 	}
+ 
++	ret = simpledrm_vc_init(sdev, of_node);
++	if (ret)
++		return ERR_PTR(ret);
++
+ 	/*
+ 	 * Modesetting
+ 	 */
+-- 
+2.43.0
+
